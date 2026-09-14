@@ -220,6 +220,18 @@ def init_db():
             UNIQUE(author_id, source_message_id)
         )
     """)
+    # Notes can now be voice as well as text (Phase 3.5): 'text' stays the
+    # default so every pre-existing row keeps its current meaning, and
+    # `file_id` is only populated for voice rows. Additive-only, so no
+    # table rebuild is needed.
+    note_columns = {row[1] for row in conn.execute("PRAGMA table_info(moment_notes)").fetchall()}
+    if "content_type" not in note_columns:
+        conn.execute("ALTER TABLE moment_notes ADD COLUMN content_type TEXT NOT NULL DEFAULT 'text'")
+        conn.commit()
+    if "file_id" not in note_columns:
+        conn.execute("ALTER TABLE moment_notes ADD COLUMN file_id TEXT")
+        conn.commit()
+
     migration = "preserve_existing_reply_notes_v1"
     if not conn.execute("SELECT 1 FROM schema_migrations WHERE name=?", (migration,)).fetchone():
         conn.execute("""
@@ -363,7 +375,8 @@ async def send_safe(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str 
 
 
 async def send_tracked(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str = None,
-                        photo_file_id: str = None, reply_markup=None, moment_id=None, reply_to=None, voice_file_id=None) -> str:
+                        photo_file_id: str = None, reply_markup=None, moment_id=None, reply_to=None,
+                        voice_file_id=None, kind: str = "received") -> str:
     """
     Delivery-tracked send used for actual moment content. Returns one of:
     'delivered' — Telegram confirmed the send.
@@ -398,7 +411,7 @@ async def send_tracked(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: s
         return "failed"
 
     if moment_id is not None:
-        remember_message(chat_id, sent.message_id, moment_id, "received")
+        remember_message(chat_id, sent.message_id, moment_id, kind)
     return "delivered"
 
 
@@ -410,9 +423,14 @@ def remember_message(chat_id, message_id, moment_id, kind):
 
 
 def original_message_id(moment_id, chat_id):
+    """The message that represents this moment in `chat_id`'s own chat —
+    'original' for the sender's copy, 'received' for the recipient's. A
+    chat only ever has one of the two for a given moment, so this is
+    unambiguous regardless of which side is asking."""
     with db() as conn:
-        row = conn.execute("SELECT message_id FROM moment_messages WHERE moment_id=? AND chat_id=? AND kind='original' LIMIT 1",
-                           (moment_id, chat_id)).fetchone()
+        row = conn.execute(
+            "SELECT message_id FROM moment_messages WHERE moment_id=? AND chat_id=? AND kind IN ('original','received') LIMIT 1",
+            (moment_id, chat_id)).fetchone()
     return row[0] if row else None
 
 
@@ -451,13 +469,13 @@ def friendly_timestamp(stamp):
 def archive_notes(moment_id, viewer_id, old_note=None):
     with db() as conn:
         moment = conn.execute("SELECT created_at FROM moments WHERE id=?", (moment_id,)).fetchone()
-        rows = conn.execute("SELECT author_id,text,created_at,delivery_status FROM moment_notes WHERE moment_id=? ORDER BY id", (moment_id,)).fetchall()
+        rows = conn.execute("SELECT author_id,text,created_at,delivery_status,content_type FROM moment_notes WHERE moment_id=? ORDER BY id", (moment_id,)).fetchall()
     if not rows:
         return ["Notes", old_note] if old_note else []
     moment_day = local_time(moment[0]).date() if moment and moment[0] else None
     lines = []
     last_author = None
-    for author, text, stamp, status in rows:
+    for author, text, stamp, status, note_kind in rows:
         if author != last_author:
             if lines:
                 lines.append("")
@@ -470,7 +488,10 @@ def archive_notes(moment_id, viewer_id, old_note=None):
                 label = f"{friendly_date(value)} · {label}"
         else:
             label = "Time unavailable"
-        lines.append(f"{label} · {text}")
+        # Voice replies aren't replayed inline in this text summary yet
+        # (that's next) — say so plainly rather than showing a blank line.
+        shown = "🎤 Voice note (not shown here yet)" if note_kind == "voice" else text
+        lines.append(f"{label} · {shown}")
         if status != "delivered":
             # Never reveal whether unconfirmed delivery was due to pause.
             lines.append("(Delivery unconfirmed)")
@@ -815,31 +836,30 @@ async def handle_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("Note already saved.")
         return
 
-    if getattr(message, "voice", None):
-        with db() as conn:
-            waiting = conn.execute("SELECT 1 FROM pending_notes WHERE user_id=?", (user_id,)).fetchone()
-        if waiting or getattr(message, "reply_to_message", None):
-            await message.reply_text("Reply notes are text-only. To share this recording as a new moment, use /cancel if needed, then resend it without replying.")
-            return
-
+    # A moment's reply thread grows in both directions: 'received'/'prompt'
+    # are the original recipient-facing targets, 'reply' is anything
+    # delivered afterward to either side as part of that same back-and-forth
+    # (see save_note()). Any of the three is a valid thing to reply to.
     replied = getattr(message, "reply_to_message", None)
     if replied is not None:
         with db() as conn:
             target = conn.execute("SELECT moment_id,kind,created_at FROM moment_messages WHERE chat_id=? AND message_id=?",
                                   (user_id, replied.message_id)).fetchone()
-            if target and target[1] in ("received", "prompt"):
+            if target and target[1] in ("received", "prompt", "reply"):
                 conn.execute("DELETE FROM pending_notes WHERE user_id=?", (user_id,))
                 conn.commit()
-        if not target or target[1] not in ("received", "prompt"):
+        if not target or target[1] not in ("received", "prompt", "reply"):
             await message.reply_text("I couldn't match that reply to a received moment. Use its Add a note button, or send without replying for a new moment.")
             return
         if target[1] == "prompt" and minutes_since(target[2]) > PENDING_NOTE_TTL_MINUTES:
             await message.reply_text("That note prompt expired. Tap Add a note again; nothing was sent.")
             return
-        if not message.text:
-            await message.reply_text("Notes are text-only for now. Reply with text, or send your photo or voice message without replying as a new moment.")
-            return
-        await save_note(update, context, target[0], message.text)
+        if message.text:
+            await save_note(update, context, target[0], text=message.text)
+        elif getattr(message, "voice", None):
+            await save_note(update, context, target[0], voice_file_id=message.voice.file_id)
+        else:
+            await message.reply_text("Notes support text or voice for now. Reply with one of those, or send your photo without replying as a new moment.")
         return
 
     # If this user owes a note reply to a specific moment, treat this as
@@ -852,7 +872,7 @@ async def handle_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.execute("DELETE FROM pending_notes WHERE user_id = ?", (user_id,))
             conn.commit()
 
-    if pending and message.text:
+    if pending and (message.text or getattr(message, "voice", None)):
         moment_id, created_at = pending
         if minutes_since(created_at) > PENDING_NOTE_TTL_MINUTES:
             # Expired note prompts must NOT silently become a new moment —
@@ -864,8 +884,11 @@ async def handle_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "or send this again if you meant it as something new."
             )
             return
+        elif message.text:
+            await save_note(update, context, moment_id, text=message.text)
+            return
         else:
-            await save_note(update, context, moment_id, message.text)
+            await save_note(update, context, moment_id, voice_file_id=message.voice.file_id)
             return
 
     row = get_partner_id(user_id)
@@ -1034,7 +1057,11 @@ async def note_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         sender_id, recipient_id, link_session, content, kind, created_at = row
-        if query.from_user.id != recipient_id:
+        replier_id = query.from_user.id
+        # Either side of the pairing can now reply — the original "Add a
+        # note" tap by the recipient, or a "Reply" tap by whoever the note
+        # was just delivered to (see save_note()).
+        if replier_id not in (sender_id, recipient_id):
             await query.answer("This one wasn't sent to you.", show_alert=True)
             return
 
@@ -1043,29 +1070,50 @@ async def note_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     await query.answer()
-    # The callback message is the actual moment, including old messages
-    # delivered before message IDs were recorded.
-    target_id = query.message.message_id
-    remember_message(recipient_id, target_id, moment_id, "received")
+    anchor_message_id = query.message.message_id
+    if replier_id == recipient_id:
+        # Backfills tracking for old "Add a note" buttons delivered before
+        # message IDs were recorded. Reply-delivery messages are already
+        # tracked at send time (see send_tracked's `kind`), so they never
+        # need this.
+        remember_message(replier_id, anchor_message_id, moment_id, "received")
+
+    # A re-tap (or a tap on a stale button) replaces any prompt already
+    # waiting for this person — delete the old prompt message itself, not
+    # just its tracking row, so the chat doesn't fill up with look-alike
+    # "reply within 15 minutes" bubbles where only the newest one works.
+    with db() as conn:
+        stale_prompt = conn.execute("SELECT message_id FROM moment_messages WHERE chat_id=? AND kind='prompt'", (replier_id,)).fetchone()
+    if stale_prompt:
+        try:
+            await context.bot.delete_message(chat_id=replier_id, message_id=stale_prompt[0])
+        except Exception as e:
+            print(f"note_callback: delete_message failed (non-fatal) chat_id={replier_id} message_id={stale_prompt[0]}: {type(e).__name__}: {e}")
+
     preview = truncate(content or ("Photo" if kind == "photo" else "Voice message" if kind == "voice" else "Moment"), 100)
     prompt = await context.bot.send_message(
-        chat_id=recipient_id,
-        text=f"Add a note · {friendly_timestamp(created_at)}\n{preview}\nReply here within {PENDING_NOTE_TTL_MINUTES} minutes, or /cancel.",
-        reply_parameters=ReplyParameters(target_id, allow_sending_without_reply=True),
-        reply_markup=ForceReply(selective=True, input_field_placeholder="Your note (optional)"),
+        chat_id=replier_id,
+        text=f"Reply · {friendly_timestamp(created_at)}\n{preview}\nReply here within {PENDING_NOTE_TTL_MINUTES} minutes, or /cancel.",
+        reply_parameters=ReplyParameters(anchor_message_id, allow_sending_without_reply=True),
+        reply_markup=ForceReply(selective=True, input_field_placeholder="Your note (optional, text or voice)"),
     )
     with db() as conn:
-        conn.execute("DELETE FROM moment_messages WHERE chat_id=? AND kind='prompt'", (recipient_id,))
+        conn.execute("DELETE FROM moment_messages WHERE chat_id=? AND kind='prompt'", (replier_id,))
         conn.execute("INSERT INTO pending_notes VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET moment_id=excluded.moment_id,created_at=excluded.created_at",
-                     (recipient_id, moment_id, now_iso()))
-        conn.execute("INSERT INTO moment_messages VALUES(?,?,?,?,?)", (recipient_id, prompt.message_id, moment_id, "prompt", now_iso()))
+                     (replier_id, moment_id, now_iso()))
+        conn.execute("INSERT INTO moment_messages VALUES(?,?,?,?,?)", (replier_id, prompt.message_id, moment_id, "prompt", now_iso()))
         conn.commit()
 
 
-async def save_note(update: Update, context: ContextTypes.DEFAULT_TYPE, moment_id: int, note_text: str):
+async def save_note(update: Update, context: ContextTypes.DEFAULT_TYPE, moment_id: int,
+                     text: str = None, voice_file_id: str = None):
+    """Records a reply (text or voice) on a moment's thread and forwards it
+    to whichever of the two participants didn't write it. Either the
+    original sender or recipient may call this — the note is attributed to
+    whoever actually sent it, and delivered to the other one."""
     if not await require_private(update):
         return
-    if len(note_text) > MAX_TEXT_LENGTH:
+    if text is not None and len(text) > MAX_TEXT_LENGTH:
         await update.message.reply_text(f"Please keep each note under {MAX_TEXT_LENGTH} characters; nothing was saved or sent.")
         return
 
@@ -1077,28 +1125,39 @@ async def save_note(update: Update, context: ContextTypes.DEFAULT_TYPE, moment_i
             return
 
         sender_id, recipient_id, link_session = row
-        if update.effective_user.id != recipient_id:
+        author_id = update.effective_user.id
+        if author_id not in (sender_id, recipient_id):
             await update.message.reply_text("That moment wasn't sent to you.")
             return
+        target_id = recipient_id if author_id == sender_id else sender_id
 
         if not moment_link_still_valid(sender_id, recipient_id, link_session):
             await update.message.reply_text("This connection isn't active anymore, so that note wasn't sent.")
             return
 
         source_id = update.message.message_id
-        if conn.execute("SELECT 1 FROM moment_notes WHERE author_id=? AND source_message_id=?", (recipient_id, source_id)).fetchone():
+        if conn.execute("SELECT 1 FROM moment_notes WHERE author_id=? AND source_message_id=?", (author_id, source_id)).fetchone():
             await update.message.reply_text("Note already saved.")
             return
         stamp = now_iso()
-        cursor = conn.execute("INSERT INTO moment_notes(moment_id,author_id,text,created_at,source_message_id,delivery_status) VALUES(?,?,?,?,?,'pending')",
-                              (moment_id, recipient_id, note_text, stamp, source_id))
+        note_content_type = "voice" if voice_file_id else "text"
+        cursor = conn.execute(
+            "INSERT INTO moment_notes(moment_id,author_id,text,created_at,source_message_id,delivery_status,content_type,file_id) "
+            "VALUES(?,?,?,?,?,'pending',?,?)",
+            (moment_id, author_id, text or "", stamp, source_id, note_content_type, voice_file_id))
         note_id = cursor.lastrowid
         conn.execute("UPDATE moments SET responded_at=? WHERE id=?", (stamp, moment_id))
         conn.commit()
 
-    status = "paused" if is_paused(sender_id) else await send_tracked(
-        context, sender_id, f"💬 {note_text}",
-        reply_to=original_message_id(moment_id, sender_id))
+    reply_keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("💬 Reply", callback_data=f"note:{moment_id}")]])
+    if is_paused(target_id):
+        status = "paused"
+    elif voice_file_id:
+        status = await send_tracked(context, target_id, voice_file_id=voice_file_id, reply_markup=reply_keyboard,
+                                     moment_id=moment_id, reply_to=original_message_id(moment_id, target_id), kind="reply")
+    else:
+        status = await send_tracked(context, target_id, text=f"💬 {text}", reply_markup=reply_keyboard,
+                                     moment_id=moment_id, reply_to=original_message_id(moment_id, target_id), kind="reply")
     with db() as conn:
         conn.execute("UPDATE moment_notes SET delivery_status=? WHERE id=?", (status, note_id))
         conn.commit()
@@ -1467,7 +1526,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "*A little bit of my day*\n\n"
         "Send a photo, voice message, or a short note any time — it goes straight to your partner, no approval step.\n\n"
-        "They can tap a reaction, reply to a received moment with a text note, or just leave it — nothing is required. Multiple notes are kept together.\n\n"
+        "They can tap a reaction, reply to a received moment with a text or voice note, or just leave it — nothing is required. Either of you can keep replying, and multiple notes are kept together.\n\n"
         "`/start` — get a pairing code (or begin if you already have one)\n"
         "`/link <code>` — connect using a code your partner sent you\n"
         "`/unlink` — disconnect (asks to confirm)\n"
