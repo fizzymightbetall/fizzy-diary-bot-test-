@@ -255,6 +255,10 @@ def recover_stuck_pending():
 
 
 def album_schema(conn):
+    conn.execute('''CREATE TABLE IF NOT EXISTS album_name_prompts (
+        user_id INTEGER NOT NULL, message_id INTEGER NOT NULL, album_id INTEGER NOT NULL,
+        created_at TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+        PRIMARY KEY(user_id,message_id))''')
     conn.execute('''CREATE TABLE IF NOT EXISTS albums (
         id INTEGER PRIMARY KEY AUTOINCREMENT, user_low INTEGER NOT NULL,
         user_high INTEGER NOT NULL, link_session TEXT NOT NULL,
@@ -339,22 +343,28 @@ async def album_name_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         name=' '.join(context.args[1:]).strip()
     except (IndexError,ValueError):
         name=''
+    await save_album_name(update,context,album_id if name else 0,name)
+
+
+async def save_album_name(update,context,album_id,name):
+    import unicodedata
     if not name or len(name)>64 or any(unicodedata.category(c) in ('Cc','Cs') for c in name):
         await update.message.reply_text('Use /albumname <album ID> <name with optional emoji>, up to 64 characters. Open an album → Customise name to find its ID.')
-        return
+        return False
     user_id=update.effective_user.id
     with db() as conn:
         album=conn.execute('SELECT user_low,user_high,link_session,tag_key FROM albums WHERE id=? AND (user_low=? OR user_high=?)',(album_id,user_id,user_id)).fetchone()
         if not album or not moment_link_still_valid(*album[:3]):
             await update.message.reply_text('That album is unavailable for editing. Only your current pairing’s albums can be renamed.')
-            return
+            return False
         conn.execute('UPDATE albums SET display_name=? WHERE id=?',(name,album_id))
         conn.commit()
     await update.message.reply_text(f'Album name saved: {name}\nKeep using #{album[3]} to add moments. Your partner will see the name when browsing; no notification is sent.')
+    return True
 
 
 def album_button_name(key,name):
-    return '#'+name if name.casefold()==key else name
+    return '#'+name if name.casefold()==key else f'{name} · #{key}'
 
 
 async def tags_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -504,17 +514,22 @@ async def album_panel(context,user_id,action,item,page):
             if not album or not moment_link_still_valid(*album[:3]):
                 await context.bot.send_message(chat_id=user_id,text='That album is unavailable for editing.')
                 return
-            text=f'Customise album name\nCurrent name: {album[4]}\nTagging shortcut: #{album[3]}\n\nSend a command like:\n/albumname {item} 🛵 Our little adventures\n\nUse up to 64 characters, with optional emoji. This changes the shared name only; captions and the tagging shortcut stay the same.'
-            rows.append([('Back to album',f'alb:open:{item}:0')])
+            prompt=await context.bot.send_message(chat_id=user_id,
+                text=f'Rename “{album[4]}” (#{album[3]})\nReply to this message with the new name, emoji welcome (up to 64 characters).\nThis prompt expires in 15 minutes. /cancel cancels it. The hashtag stays the same.',
+                reply_markup=ForceReply(selective=True,input_field_placeholder='New album name'))
+            conn.execute('UPDATE album_name_prompts SET active=0 WHERE user_id=?',(user_id,))
+            conn.execute('INSERT INTO album_name_prompts VALUES(?,?,?,?,1)',(user_id,prompt.message_id,item,now_iso()))
+            conn.commit()
+            return
         elif action=='open':
-            album=conn.execute('SELECT user_low,user_high,link_session,display_name FROM albums WHERE id=? AND (user_low=? OR user_high=?)',(item,user_id,user_id)).fetchone()
+            album=conn.execute('SELECT user_low,user_high,link_session,display_name,tag_key FROM albums WHERE id=? AND (user_low=? OR user_high=?)',(item,user_id,user_id)).fetchone()
             if not album:
                 await context.bot.send_message(chat_id=user_id,text='That album is unavailable.')
                 return
             matches=conn.execute('''SELECT m.id FROM moments m JOIN album_moments am ON am.moment_id=m.id
                 WHERE am.album_id=? AND MIN(m.sender_id,m.recipient_id)=? AND MAX(m.sender_id,m.recipient_id)=?
                 AND m.link_session=? AND m.delivery_status IN ('delivered','legacy') ORDER BY m.id DESC LIMIT 2 OFFSET ?''',(item,*album[:3],page)).fetchall()
-            text='📚 '+album[3]
+            text='📚 '+album[3]+'\nAdd moments with: #'+album[4]
             if moment_link_still_valid(*album[:3]):
                 rows.append([('Customise name',f'alb:name:{item}:0')])
             if matches:
@@ -1013,11 +1028,14 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user_id = update.effective_user.id
     with db() as conn:
+        renamed = conn.execute("UPDATE album_name_prompts SET active=0 WHERE user_id=? AND active=1", (user_id,)).rowcount
         cursor = conn.execute("DELETE FROM pending_notes WHERE user_id = ?", (user_id,))
         conn.execute("DELETE FROM moment_messages WHERE chat_id=? AND kind='prompt'", (user_id,))
         conn.commit()
         deleted = cursor.rowcount
-    if deleted:
+    if renamed:
+        await update.message.reply_text("Album renaming cancelled." + (" Pending note cancelled too." if deleted else ""))
+    elif deleted:
         await update.message.reply_text("Cancelled — that note won't be sent.")
     else:
         await update.message.reply_text("Nothing to cancel.")
@@ -1098,6 +1116,23 @@ async def handle_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     message = update.message
     user_id = update.effective_user.id
+
+    replied = getattr(message, 'reply_to_message', None)
+    if replied:
+        with db() as conn:
+            rename=conn.execute('SELECT album_id,created_at,active FROM album_name_prompts WHERE user_id=? AND message_id=?',(user_id,replied.message_id)).fetchone()
+        if rename:
+            if not rename[2] or minutes_since(rename[1])>15:
+                await message.reply_text('That rename prompt is no longer active. Open the album and tap Customise name again. Nothing was sent.')
+                return
+            if not message.text:
+                await message.reply_text('Reply with a text name, with optional emoji, or /cancel.')
+                return
+            if await save_album_name(update,context,rename[0],message.text.strip()):
+                with db() as conn:
+                    conn.execute('UPDATE album_name_prompts SET active=0 WHERE user_id=? AND message_id=?',(user_id,replied.message_id))
+                    conn.commit()
+            return
 
     # Redelivered updates must not turn an already-saved button-mode note
     # into a new moment after its pending state has been consumed.
