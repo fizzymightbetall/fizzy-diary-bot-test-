@@ -330,6 +330,33 @@ async def albums_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await album_panel(context,update.effective_user.id,'home',0,0)
 
 
+async def album_name_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_private(update):
+        return
+    import unicodedata
+    try:
+        album_id=int(context.args[0])
+        name=' '.join(context.args[1:]).strip()
+    except (IndexError,ValueError):
+        name=''
+    if not name or len(name)>64 or any(unicodedata.category(c) in ('Cc','Cs') for c in name):
+        await update.message.reply_text('Use /albumname <album ID> <name with optional emoji>, up to 64 characters. Open an album → Customise name to find its ID.')
+        return
+    user_id=update.effective_user.id
+    with db() as conn:
+        album=conn.execute('SELECT user_low,user_high,link_session,tag_key FROM albums WHERE id=? AND (user_low=? OR user_high=?)',(album_id,user_id,user_id)).fetchone()
+        if not album or not moment_link_still_valid(*album[:3]):
+            await update.message.reply_text('That album is unavailable for editing. Only your current pairing’s albums can be renamed.')
+            return
+        conn.execute('UPDATE albums SET display_name=? WHERE id=?',(name,album_id))
+        conn.commit()
+    await update.message.reply_text(f'Album name saved: {name}\nKeep using #{album[3]} to add moments. Your partner will see the name when browsing; no notification is sent.')
+
+
+def album_button_name(key,name):
+    return '#'+name if name.casefold()==key else name
+
+
 async def tags_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_private(update):
         return
@@ -366,7 +393,7 @@ async def album_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         _,action,item,page=query.data.split(':')
         item,page=int(item),int(page)
-        if action not in ('home','earlier','scope','open','all','edit','add','remove') or item<0 or page<0:
+        if action not in ('home','earlier','scope','open','all','edit','add','remove','name') or item<0 or page<0:
             raise ValueError()
     except (ValueError,TypeError):
         await query.answer('This button is unavailable.')
@@ -458,20 +485,27 @@ async def album_panel(context,user_id,action,item,page):
                 if action=='edit':
                     attached=moment_album_labels(conn,ref)
                     attached_ids={x[0] for x in attached}
-                    text=f'Manage tags · moment {item}\n'+(' '.join('#'+x[1] for x in attached) or 'No tags yet')
+                    text=f'Manage tags · moment {item}\n'+(', '.join(x[1] for x in attached) or 'No tags yet')
                     text+=f'\n\nCreate/add: /tags {item} add #Bangkok #Food\nRemove: /tags {item} remove #Food\nRemoving tags keeps the moment and all its notes.'
                     for aid,key,name in albums[:page_size]:
                         remove=aid in attached_ids
-                        rows.append([(f'{"− Remove" if remove else "+ Add"} #{name}',f'alb:{"remove" if remove else "add"}:{item}:{aid}')])
+                        rows.append([(f'{"− Remove" if remove else "+ Add"} {album_button_name(key,name)}',f'alb:{"remove" if remove else "add"}:{item}:{aid}')])
                 else:
                     text='📚 Albums for this pairing\nTags are optional. Open All moments to tag an older photo.'
                     rows.append([('All moments (including untagged)',f'alb:all:{item}:0')])
                     for aid,key,name in albums[:page_size]:
-                        rows.append([('#'+name,f'alb:open:{aid}:0')])
+                        rows.append([(album_button_name(key,name),f'alb:open:{aid}:0')])
                 if page: rows.append([('← Previous',f'alb:{action}:{item}:{page-1}')])
                 if len(albums)>page_size: rows.append([('Next →',f'alb:{action}:{item}:{page+1}')])
                 rows.append([('Earlier albums','alb:earlier:0:0')])
                 rows.append([('Current albums','alb:home:0:0')])
+        elif action=='name':
+            album=conn.execute('SELECT user_low,user_high,link_session,tag_key,display_name FROM albums WHERE id=? AND (user_low=? OR user_high=?)',(item,user_id,user_id)).fetchone()
+            if not album or not moment_link_still_valid(*album[:3]):
+                await context.bot.send_message(chat_id=user_id,text='That album is unavailable for editing.')
+                return
+            text=f'Customise album name\nCurrent name: {album[4]}\nTagging shortcut: #{album[3]}\n\nSend a command like:\n/albumname {item} 🛵 Our little adventures\n\nUse up to 64 characters, with optional emoji. This changes the shared name only; captions and the tagging shortcut stay the same.'
+            rows.append([('Back to album',f'alb:open:{item}:0')])
         elif action=='open':
             album=conn.execute('SELECT user_low,user_high,link_session,display_name FROM albums WHERE id=? AND (user_low=? OR user_high=?)',(item,user_id,user_id)).fetchone()
             if not album:
@@ -481,6 +515,8 @@ async def album_panel(context,user_id,action,item,page):
                 WHERE am.album_id=? AND MIN(m.sender_id,m.recipient_id)=? AND MAX(m.sender_id,m.recipient_id)=?
                 AND m.link_session=? AND m.delivery_status IN ('delivered','legacy') ORDER BY m.id DESC LIMIT 2 OFFSET ?''',(item,*album[:3],page)).fetchall()
             text='📚 '+album[3]
+            if moment_link_still_valid(*album[:3]):
+                rows.append([('Customise name',f'alb:name:{item}:0')])
             if matches:
                 moment=album_moment(conn,user_id,matches[0][0])
                 if page: rows.append([('← Previous',f'alb:open:{item}:{page-1}')])
@@ -1485,6 +1521,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/cancel` — cancel a note you tapped 'Add a note' for but haven't sent yet\n"
         "`/reactions` — view or customize your pair's reactions\n"
         "`/albums` — browse shared albums and manage tags\n"
+        "`/albumname ID name` — customise an album name (emoji welcome)\n"
         "Add optional #Bangkok #Food to photo captions or new text moments.\n"
         "`/tags <id> add #tag` or `/tags <id> remove #tag` — edit tags\n"
         "`/memory` — revisit a random memory, just for you\n"
@@ -1518,6 +1555,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("albums", albums_command))
     app.add_handler(CommandHandler("tags", tags_command))
+    app.add_handler(CommandHandler("albumname", album_name_command))
     app.add_handler(CallbackQueryHandler(album_callback, pattern="^alb:"))
 
     app.add_handler(CallbackQueryHandler(unlink_callback, pattern="^unlink(confirm|cancel):"))
