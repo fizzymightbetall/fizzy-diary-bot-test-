@@ -121,11 +121,6 @@ def init_db():
         )
     """)
 
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(moments)").fetchall()}
-    if "voice_duration" not in columns:
-        conn.execute("ALTER TABLE moments ADD COLUMN voice_duration INTEGER")
-        conn.commit()
-
     # Migration path for a DB created before delivery_status/link_session
     # existed. Rows from before that point predate delivery tracking
     # entirely — the old code couldn't guarantee they were delivered, so we
@@ -220,18 +215,6 @@ def init_db():
             UNIQUE(author_id, source_message_id)
         )
     """)
-    # Notes can now be voice as well as text (Phase 3.5): 'text' stays the
-    # default so every pre-existing row keeps its current meaning, and
-    # `file_id` is only populated for voice rows. Additive-only, so no
-    # table rebuild is needed.
-    note_columns = {row[1] for row in conn.execute("PRAGMA table_info(moment_notes)").fetchall()}
-    if "content_type" not in note_columns:
-        conn.execute("ALTER TABLE moment_notes ADD COLUMN content_type TEXT NOT NULL DEFAULT 'text'")
-        conn.commit()
-    if "file_id" not in note_columns:
-        conn.execute("ALTER TABLE moment_notes ADD COLUMN file_id TEXT")
-        conn.commit()
-
     migration = "preserve_existing_reply_notes_v1"
     if not conn.execute("SELECT 1 FROM schema_migrations WHERE name=?", (migration,)).fetchone():
         conn.execute("""
@@ -240,6 +223,7 @@ def init_db():
             FROM moments WHERE reply_note IS NOT NULL AND reply_note != ''
         """)
         conn.execute("INSERT INTO schema_migrations VALUES(?)", (migration,))
+    album_schema(conn)
     conn.commit()
     conn.close()
 
@@ -268,6 +252,234 @@ def recover_stuck_pending():
         )
         conn.execute("UPDATE moment_notes SET delivery_status='uncertain' WHERE delivery_status='pending' AND created_at < ?", (cutoff,))
         conn.commit()
+
+
+def album_schema(conn):
+    conn.execute('''CREATE TABLE IF NOT EXISTS albums (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_low INTEGER NOT NULL,
+        user_high INTEGER NOT NULL, link_session TEXT NOT NULL,
+        tag_key TEXT NOT NULL, display_name TEXT NOT NULL,
+        UNIQUE(user_low,user_high,link_session,tag_key))''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS album_moments (
+        album_id INTEGER NOT NULL, moment_id INTEGER NOT NULL,
+        PRIMARY KEY(album_id,moment_id))''')
+    conn.execute('CREATE INDEX IF NOT EXISTS album_moment_lookup ON album_moments(moment_id)')
+
+
+def extract_album_tags(text):
+    import re
+    import unicodedata
+    labels = []
+    seen = set()
+    for match in re.finditer(r'(?<![\w#])#(\w+)', unicodedata.normalize('NFC', text or '')):
+        label = match.group(1)
+        key = label.casefold()
+        if len(label) <= 32 and key not in seen:
+            labels.append((key, label))
+            seen.add(key)
+        if len(labels) == 10:
+            break
+    return labels
+
+
+def album_moment(conn, user_id, moment_id, edit=False):
+    row = conn.execute('''SELECT id,sender_id,recipient_id,content_type,file_id,text,
+        created_at,reaction,reply_note,delivery_status,link_session FROM moments
+        WHERE id=? AND (sender_id=? OR recipient_id=?)
+        AND delivery_status IN ('delivered','legacy')''', (moment_id,user_id,user_id)).fetchone()
+    if not row:
+        return None
+    if edit and (not row[10] or not moment_link_still_valid(row[1],row[2],row[10])):
+        return None
+    return row
+
+
+def moment_album_labels(conn, moment):
+    return conn.execute('''SELECT a.id,a.display_name FROM albums a
+        JOIN album_moments am ON am.album_id=a.id WHERE am.moment_id=?
+        AND a.user_low=? AND a.user_high=? AND a.link_session=? ORDER BY a.tag_key''',
+        (moment[0],min(moment[1],moment[2]),max(moment[1],moment[2]),moment[10])).fetchall()
+
+
+def apply_album_tags(user_id, moment_id, tags, remove=False):
+    with db() as conn:
+        moment = album_moment(conn,user_id,moment_id,edit=True)
+        if not moment:
+            return False
+        scope=(min(moment[1],moment[2]),max(moment[1],moment[2]),moment[10])
+        for key,label in tags:
+            if not remove:
+                conn.execute('INSERT OR IGNORE INTO albums(user_low,user_high,link_session,tag_key,display_name) VALUES(?,?,?,?,?)',(*scope,key,label))
+            row=conn.execute('SELECT id FROM albums WHERE user_low=? AND user_high=? AND link_session=? AND tag_key=?',(*scope,key)).fetchone()
+            if row:
+                if remove:
+                    conn.execute('DELETE FROM album_moments WHERE album_id=? AND moment_id=?',(row[0],moment_id))
+                else:
+                    conn.execute('INSERT OR IGNORE INTO album_moments VALUES(?,?)',(row[0],moment_id))
+        conn.commit()
+        return True
+
+
+def album_keyboard(rows):
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label,callback_data=data) for label,data in row] for row in rows])
+
+
+async def albums_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_private(update):
+        return
+    await album_panel(context,update.effective_user.id,'home',0,0)
+
+
+async def tags_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_private(update):
+        return
+    user_id=update.effective_user.id
+    args=context.args
+    try:
+        moment_id=int(args[0])
+    except (IndexError,ValueError):
+        await update.message.reply_text('Open /albums → All moments → Manage tags. Or use /tags <moment ID> add #Bangkok #Food (or remove).')
+        return
+    if len(args)==1:
+        await album_panel(context,user_id,'edit',moment_id,0)
+        return
+    if len(args)<3 or args[1].lower() not in ('add','remove'):
+        await update.message.reply_text(f'Use /tags {moment_id} add #Bangkok #Food or /tags {moment_id} remove #Food.')
+        return
+    raw=' '.join(args[2:])
+    tags=extract_album_tags(raw)
+    # Commands are strict; never silently truncate a requested edit.
+    if not tags or len(args[2:])>10 or any(not x.startswith('#') or extract_album_tags(x)!=[(x[1:].casefold(),x[1:])] for x in args[2:]):
+        await update.message.reply_text('Use 1–10 hashtags, each up to 32 letters, numbers or underscores. Example: #Bangkok #Raya2026')
+        return
+    if not apply_album_tags(user_id,moment_id,tags,args[1].lower()=='remove'):
+        await update.message.reply_text('That moment cannot be edited. Only moments in your active pairing session can be changed.')
+        return
+    await album_panel(context,user_id,'edit',moment_id,0)
+
+
+async def album_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query=update.callback_query
+    if not is_private_chat(update):
+        await query.answer('Open /albums in your private chat with the bot.')
+        return
+    try:
+        _,action,item,page=query.data.split(':')
+        item,page=int(item),int(page)
+        if action not in ('home','scope','open','all','edit','add','remove') or item<0 or page<0:
+            raise ValueError()
+    except (ValueError,TypeError):
+        await query.answer('This button is unavailable.')
+        return
+    await query.answer()
+    user_id=update.effective_user.id
+    if action in ('add','remove'):
+        # item is moment ID; page is album ID. Both scope and membership are checked.
+        with db() as conn:
+            moment=album_moment(conn,user_id,item,edit=True)
+            album=conn.execute('SELECT user_low,user_high,link_session,tag_key,display_name FROM albums WHERE id=?',(page,)).fetchone()
+        if not moment or not album or tuple(album[:3])!=(min(moment[1],moment[2]),max(moment[1],moment[2]),moment[10]):
+            await context.bot.send_message(chat_id=user_id,text='That album or moment is unavailable for editing.')
+            return
+        apply_album_tags(user_id,item,[tuple(album[3:])],action=='remove')
+        await album_panel(context,user_id,'edit',item,0)
+        return
+    await album_panel(context,user_id,action,item,page)
+
+
+async def album_panel(context,user_id,action,item,page):
+    # Read authorization is checked on every callback, not just on the first screen.
+    # A scope is identified by an accessible moment ID; no session string is trusted from clients.
+    rows=[]
+    moment=None
+    page_size=8
+    with db() as conn:
+        if action=='home':
+            scopes=conn.execute('''SELECT MAX(id),sender_id,recipient_id,link_session,MAX(created_at)
+                FROM moments WHERE (sender_id=? OR recipient_id=?)
+                AND delivery_status IN ('delivered','legacy') AND link_session IS NOT NULL AND link_session!=''
+                GROUP BY MIN(sender_id,recipient_id),MAX(sender_id,recipient_id),link_session
+                ORDER BY MAX(created_at) DESC LIMIT ? OFFSET ?''',(user_id,user_id,page_size+1,page*page_size)).fetchall()
+            text='📚 Your shared albums\nChoose a pairing session. Browsing is private.\n'
+            if not scopes:
+                text+='No moments with a known pairing session yet. Older unassigned memories remain in /memory.'
+            for mid,a,b,session,stamp in scopes[:page_size]:
+                active=moment_link_still_valid(a,b,session)
+                rows.append([(f'{"Current pair" if active else "Earlier pairing"} · {friendly_timestamp(stamp)}',f'alb:scope:{mid}:0')])
+            if page: rows.append([('← Previous',f'alb:home:0:{page-1}')])
+            if len(scopes)>page_size: rows.append([('Next →',f'alb:home:0:{page+1}')])
+        elif action in ('scope','all','edit'):
+            ref=album_moment(conn,user_id,item,edit=action=='edit')
+            if not ref or not ref[10]:
+                await context.bot.send_message(chat_id=user_id,text='That moment or pairing session is unavailable. Older memories without a known session remain in /memory.')
+                return
+            scope=(min(ref[1],ref[2]),max(ref[1],ref[2]),ref[10])
+            if action=='all':
+                matches=conn.execute('''SELECT id FROM moments WHERE MIN(sender_id,recipient_id)=? AND MAX(sender_id,recipient_id)=?
+                    AND link_session=? AND delivery_status IN ('delivered','legacy') ORDER BY id DESC LIMIT 2 OFFSET ?''',(*scope,page)).fetchall()
+                if not matches:
+                    text='No moment on this page.'
+                else:
+                    moment=album_moment(conn,user_id,matches[0][0])
+                    text='All moments'
+                    if page: rows.append([('← Previous',f'alb:all:{item}:{page-1}')])
+                    if len(matches)>1: rows.append([('Next →',f'alb:all:{item}:{page+1}')])
+                rows.append([('Back to albums',f'alb:scope:{item}:0')])
+            else:
+                albums=conn.execute('''SELECT id,tag_key,display_name FROM albums WHERE user_low=? AND user_high=? AND link_session=?
+                    ORDER BY tag_key LIMIT ? OFFSET ?''',(*scope,page_size+1,page*page_size)).fetchall()
+                if action=='edit':
+                    attached=moment_album_labels(conn,ref)
+                    attached_ids={x[0] for x in attached}
+                    text=f'Manage tags · moment {item}\n'+(' '.join('#'+x[1] for x in attached) or 'No tags yet')
+                    text+=f'\n\nCreate/add: /tags {item} add #Bangkok #Food\nRemove: /tags {item} remove #Food\nRemoving tags keeps the moment and all its notes.'
+                    for aid,key,name in albums[:page_size]:
+                        remove=aid in attached_ids
+                        rows.append([(f'{"− Remove" if remove else "+ Add"} #{name}',f'alb:{"remove" if remove else "add"}:{item}:{aid}')])
+                else:
+                    text='📚 Albums for this pairing\nTags are optional. Open All moments to tag an older photo.'
+                    rows.append([('All moments (including untagged)',f'alb:all:{item}:0')])
+                    for aid,key,name in albums[:page_size]:
+                        rows.append([('#'+name,f'alb:open:{aid}:0')])
+                if page: rows.append([('← Previous',f'alb:{action}:{item}:{page-1}')])
+                if len(albums)>page_size: rows.append([('Next →',f'alb:{action}:{item}:{page+1}')])
+                rows.append([('Pairing sessions','alb:home:0:0')])
+        elif action=='open':
+            album=conn.execute('SELECT user_low,user_high,link_session,display_name FROM albums WHERE id=? AND (user_low=? OR user_high=?)',(item,user_id,user_id)).fetchone()
+            if not album:
+                await context.bot.send_message(chat_id=user_id,text='That album is unavailable.')
+                return
+            matches=conn.execute('''SELECT m.id FROM moments m JOIN album_moments am ON am.moment_id=m.id
+                WHERE am.album_id=? AND MIN(m.sender_id,m.recipient_id)=? AND MAX(m.sender_id,m.recipient_id)=?
+                AND m.link_session=? AND m.delivery_status IN ('delivered','legacy') ORDER BY m.id DESC LIMIT 2 OFFSET ?''',(item,*album[:3],page)).fetchall()
+            text='#'+album[3]
+            if matches:
+                moment=album_moment(conn,user_id,matches[0][0])
+                if page: rows.append([('← Previous',f'alb:open:{item}:{page-1}')])
+                if len(matches)>1: rows.append([('Next →',f'alb:open:{item}:{page+1}')])
+                rows.append([('Back to albums',f'alb:scope:{moment[0]}:0')])
+            else:
+                text+='\nNo moments in this album on this page.'
+                rows.append([('Pairing sessions','alb:home:0:0')])
+        else:
+            return
+        if moment:
+            labels=moment_album_labels(conn,moment)
+            text+='\n'+(' '.join('#'+x[1] for x in labels) or 'No tags')
+            if moment[10] and moment_link_still_valid(moment[1],moment[2],moment[10]):
+                rows.append([('Manage tags',f'alb:edit:{moment[0]}:0')])
+    keyboard=album_keyboard(rows)
+    if moment:
+        mid,sender,recipient,kind,file_id,content,stamp,reaction,note,status,session=moment
+        if kind=='photo':
+            delivered=await send_safe(context,user_id,photo_file_id=file_id)
+            if not delivered:
+                await context.bot.send_message(chat_id=user_id,text='Could not load the photo. You can still browse its details.')
+        if content:
+            await send_memory_text(context,user_id,content)
+        text+='\n\n'+memory_details(mid,user_id,sender,stamp,reaction,note,status,heading='📖')
+    await send_memory_text(context,user_id,text,keyboard)
+
 
 
 init_db()
@@ -375,8 +587,7 @@ async def send_safe(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str 
 
 
 async def send_tracked(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str = None,
-                        photo_file_id: str = None, reply_markup=None, moment_id=None, reply_to=None,
-                        voice_file_id=None, kind: str = "received") -> str:
+                        photo_file_id: str = None, reply_markup=None, moment_id=None, reply_to=None) -> str:
     """
     Delivery-tracked send used for actual moment content. Returns one of:
     'delivered' — Telegram confirmed the send.
@@ -392,10 +603,7 @@ async def send_tracked(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: s
     """
     options = {"reply_parameters": ReplyParameters(reply_to, allow_sending_without_reply=True)} if reply_to else {}
     try:
-        if voice_file_id:
-            sent = await context.bot.send_voice(chat_id=chat_id, voice=voice_file_id, caption=text,
-                                               reply_markup=reply_markup, **options)
-        elif photo_file_id:
+        if photo_file_id:
             sent = await context.bot.send_photo(chat_id=chat_id, photo=photo_file_id, caption=text,
                                           reply_markup=reply_markup, **options)
         else:
@@ -411,7 +619,7 @@ async def send_tracked(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: s
         return "failed"
 
     if moment_id is not None:
-        remember_message(chat_id, sent.message_id, moment_id, kind)
+        remember_message(chat_id, sent.message_id, moment_id, "received")
     return "delivered"
 
 
@@ -423,14 +631,9 @@ def remember_message(chat_id, message_id, moment_id, kind):
 
 
 def original_message_id(moment_id, chat_id):
-    """The message that represents this moment in `chat_id`'s own chat —
-    'original' for the sender's copy, 'received' for the recipient's. A
-    chat only ever has one of the two for a given moment, so this is
-    unambiguous regardless of which side is asking."""
     with db() as conn:
-        row = conn.execute(
-            "SELECT message_id FROM moment_messages WHERE moment_id=? AND chat_id=? AND kind IN ('original','received') LIMIT 1",
-            (moment_id, chat_id)).fetchone()
+        row = conn.execute("SELECT message_id FROM moment_messages WHERE moment_id=? AND chat_id=? AND kind='original' LIMIT 1",
+                           (moment_id, chat_id)).fetchone()
     return row[0] if row else None
 
 
@@ -469,13 +672,13 @@ def friendly_timestamp(stamp):
 def archive_notes(moment_id, viewer_id, old_note=None):
     with db() as conn:
         moment = conn.execute("SELECT created_at FROM moments WHERE id=?", (moment_id,)).fetchone()
-        rows = conn.execute("SELECT author_id,text,created_at,delivery_status,content_type FROM moment_notes WHERE moment_id=? ORDER BY id", (moment_id,)).fetchall()
+        rows = conn.execute("SELECT author_id,text,created_at,delivery_status FROM moment_notes WHERE moment_id=? ORDER BY id", (moment_id,)).fetchall()
     if not rows:
         return ["Notes", old_note] if old_note else []
     moment_day = local_time(moment[0]).date() if moment and moment[0] else None
     lines = []
     last_author = None
-    for author, text, stamp, status, note_kind in rows:
+    for author, text, stamp, status in rows:
         if author != last_author:
             if lines:
                 lines.append("")
@@ -488,10 +691,7 @@ def archive_notes(moment_id, viewer_id, old_note=None):
                 label = f"{friendly_date(value)} · {label}"
         else:
             label = "Time unavailable"
-        # Voice replies aren't replayed inline in this text summary yet
-        # (that's next) — say so plainly rather than showing a blank line.
-        shown = "🎤 Voice note (not shown here yet)" if note_kind == "voice" else text
-        lines.append(f"{label} · {shown}")
+        lines.append(f"{label} · {text}")
         if status != "delivered":
             # Never reveal whether unconfirmed delivery was due to pause.
             lines.append("(Delivery unconfirmed)")
@@ -542,7 +742,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     existing = get_partner_id(user_id)
     if existing:
         await update.message.reply_text(
-            "You're already linked. Send a photo, voice message, or a little note any time — "
+            "You're already linked. Send a photo or a little note any time — "
             "it'll go straight to your partner. Use /unlink to disconnect."
         )
         return
@@ -625,8 +825,8 @@ async def link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.execute("DELETE FROM pending_links WHERE user_id IN (?, ?)", (user_id, code_owner_id))
         conn.commit()
 
-    await update.message.reply_text("You're linked! Send a photo, voice message, or a little note whenever — it'll go straight to them.")
-    await send_safe(context, code_owner_id, "You're linked! Send a photo, voice message, or a little note whenever — it'll go straight to them.")
+    await update.message.reply_text("You're linked! Send a photo or a little note whenever — it'll go straight to them.")
+    await send_safe(context, code_owner_id, "You're linked! Send a photo or a little note whenever — it'll go straight to them.")
 
 
 async def unlink(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -693,7 +893,7 @@ async def unlink_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.execute("DELETE FROM links WHERE user_id = ?", (requester_id,))
         conn.execute("DELETE FROM links WHERE user_id = ?", (partner_id,))
         conn.execute("DELETE FROM pending_notes WHERE user_id IN (?, ?)", (requester_id, partner_id))
-        conn.execute("DELETE FROM moment_messages WHERE chat_id IN (?,?) AND kind IN ('prompt','diary')", (requester_id, partner_id))
+        conn.execute("DELETE FROM moment_messages WHERE chat_id IN (?,?) AND kind='prompt'", (requester_id, partner_id))
         conn.commit()
 
     # Deliberately no message to partner_id here — unlink is designed to be
@@ -836,30 +1036,24 @@ async def handle_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("Note already saved.")
         return
 
-    # A moment's reply thread grows in both directions: 'received'/'prompt'
-    # are the original recipient-facing targets, 'reply' is anything
-    # delivered afterward to either side as part of that same back-and-forth
-    # (see save_note()). Any of the three is a valid thing to reply to.
     replied = getattr(message, "reply_to_message", None)
     if replied is not None:
         with db() as conn:
             target = conn.execute("SELECT moment_id,kind,created_at FROM moment_messages WHERE chat_id=? AND message_id=?",
                                   (user_id, replied.message_id)).fetchone()
-            if target and target[1] in ("received", "prompt", "reply"):
+            if target and target[1] in ("received", "prompt"):
                 conn.execute("DELETE FROM pending_notes WHERE user_id=?", (user_id,))
                 conn.commit()
-        if not target or target[1] not in ("received", "prompt", "reply"):
+        if not target or target[1] not in ("received", "prompt"):
             await message.reply_text("I couldn't match that reply to a received moment. Use its Add a note button, or send without replying for a new moment.")
             return
         if target[1] == "prompt" and minutes_since(target[2]) > PENDING_NOTE_TTL_MINUTES:
             await message.reply_text("That note prompt expired. Tap Add a note again; nothing was sent.")
             return
-        if message.text:
-            await save_note(update, context, target[0], text=message.text)
-        elif getattr(message, "voice", None):
-            await save_note(update, context, target[0], voice_file_id=message.voice.file_id)
-        else:
-            await message.reply_text("Notes support text or voice for now. Reply with one of those, or send your photo without replying as a new moment.")
+        if not message.text:
+            await message.reply_text("Notes are text-only for now. Reply with text, or send your photo without replying as a new moment.")
+            return
+        await save_note(update, context, target[0], message.text)
         return
 
     # If this user owes a note reply to a specific moment, treat this as
@@ -872,7 +1066,7 @@ async def handle_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.execute("DELETE FROM pending_notes WHERE user_id = ?", (user_id,))
             conn.commit()
 
-    if pending and (message.text or getattr(message, "voice", None)):
+    if pending and message.text:
         moment_id, created_at = pending
         if minutes_since(created_at) > PENDING_NOTE_TTL_MINUTES:
             # Expired note prompts must NOT silently become a new moment —
@@ -884,11 +1078,8 @@ async def handle_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "or send this again if you meant it as something new."
             )
             return
-        elif message.text:
-            await save_note(update, context, moment_id, text=message.text)
-            return
         else:
-            await save_note(update, context, moment_id, voice_file_id=message.voice.file_id)
+            await save_note(update, context, moment_id, message.text)
             return
 
     row = get_partner_id(user_id)
@@ -898,14 +1089,7 @@ async def handle_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     partner_id, _, my_linked_at = row
 
-    voice_duration = None
-    if getattr(message, "voice", None):
-        content_type = "voice"
-        file_id = message.voice.file_id
-        duration = message.voice.duration
-        voice_duration = int(duration.total_seconds() if isinstance(duration, timedelta) else duration)
-        text = truncate(message.caption or None, MAX_CAPTION_LENGTH)
-    elif message.photo:
+    if message.photo:
         content_type = "photo"
         file_id = message.photo[-1].file_id
         text = truncate(message.caption or None, MAX_CAPTION_LENGTH)
@@ -924,18 +1108,16 @@ async def handle_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     with db() as conn:
         cursor = conn.execute(
-            "INSERT INTO moments (sender_id, recipient_id, content_type, file_id, text, created_at, delivery_status, link_session, voice_duration) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
-            (user_id, partner_id, content_type, file_id, text, now_iso(), session_token(my_linked_at), voice_duration),
+            "INSERT INTO moments (sender_id, recipient_id, content_type, file_id, text, created_at, delivery_status, link_session) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
+            (user_id, partner_id, content_type, file_id, text, now_iso(), session_token(my_linked_at)),
         )
         moment_id = cursor.lastrowid
         conn.commit()
 
     remember_message(user_id, message.message_id, moment_id, "original")
     keyboard = reaction_keyboard(moment_id)
-    if content_type == "voice":
-        status = await send_tracked(context, partner_id, text=text, voice_file_id=file_id, reply_markup=keyboard, moment_id=moment_id)
-    elif content_type == "photo":
+    if content_type == "photo":
         status = await send_tracked(context, partner_id, text=text, photo_file_id=file_id, reply_markup=keyboard, moment_id=moment_id)
     else:
         status = await send_tracked(context, partner_id, text=text, reply_markup=keyboard, moment_id=moment_id)
@@ -946,6 +1128,14 @@ async def handle_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if status == "delivered":
         await message.reply_text("Sent 💌")
+        # Optional organization happens after successful delivery and acknowledgment.
+        tags = extract_album_tags(message.caption if message.photo else message.text)
+        if tags:
+            try:
+                apply_album_tags(user_id, moment_id, tags)
+            except Exception as e:
+                print(f"Album tagging failed for moment {moment_id}: {type(e).__name__}")
+                await message.reply_text(f"Your moment was sent, but its tags could not be saved. Retry with /tags {moment_id} add " + " ".join('#'+label for _,label in tags))
     elif status == "uncertain":
         # Deliberately doesn't tell them to watch for a reply as the way to
         # find out — that just reintroduces "wait and see if they respond"
@@ -1057,11 +1247,7 @@ async def note_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         sender_id, recipient_id, link_session, content, kind, created_at = row
-        replier_id = query.from_user.id
-        # Either side of the pairing can now reply — the original "Add a
-        # note" tap by the recipient, or a "Reply" tap by whoever the note
-        # was just delivered to (see save_note()).
-        if replier_id not in (sender_id, recipient_id):
+        if query.from_user.id != recipient_id:
             await query.answer("This one wasn't sent to you.", show_alert=True)
             return
 
@@ -1070,50 +1256,29 @@ async def note_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     await query.answer()
-    anchor_message_id = query.message.message_id
-    if replier_id == recipient_id:
-        # Backfills tracking for old "Add a note" buttons delivered before
-        # message IDs were recorded. Reply-delivery messages are already
-        # tracked at send time (see send_tracked's `kind`), so they never
-        # need this.
-        remember_message(replier_id, anchor_message_id, moment_id, "received")
-
-    # A re-tap (or a tap on a stale button) replaces any prompt already
-    # waiting for this person — delete the old prompt message itself, not
-    # just its tracking row, so the chat doesn't fill up with look-alike
-    # "reply within 15 minutes" bubbles where only the newest one works.
-    with db() as conn:
-        stale_prompt = conn.execute("SELECT message_id FROM moment_messages WHERE chat_id=? AND kind='prompt'", (replier_id,)).fetchone()
-    if stale_prompt:
-        try:
-            await context.bot.delete_message(chat_id=replier_id, message_id=stale_prompt[0])
-        except Exception as e:
-            print(f"note_callback: delete_message failed (non-fatal) chat_id={replier_id} message_id={stale_prompt[0]}: {type(e).__name__}: {e}")
-
-    preview = truncate(content or ("Photo" if kind == "photo" else "Voice message" if kind == "voice" else "Moment"), 100)
+    # The callback message is the actual moment, including old messages
+    # delivered before message IDs were recorded.
+    target_id = query.message.message_id
+    remember_message(recipient_id, target_id, moment_id, "received")
+    preview = truncate(content or ("Photo" if kind == "photo" else "Moment"), 100)
     prompt = await context.bot.send_message(
-        chat_id=replier_id,
-        text=f"Reply · {friendly_timestamp(created_at)}\n{preview}\nReply here within {PENDING_NOTE_TTL_MINUTES} minutes, or /cancel.",
-        reply_parameters=ReplyParameters(anchor_message_id, allow_sending_without_reply=True),
-        reply_markup=ForceReply(selective=True, input_field_placeholder="Your note (optional, text or voice)"),
+        chat_id=recipient_id,
+        text=f"Add a note · {friendly_timestamp(created_at)}\n{preview}\nReply here within {PENDING_NOTE_TTL_MINUTES} minutes, or /cancel.",
+        reply_parameters=ReplyParameters(target_id, allow_sending_without_reply=True),
+        reply_markup=ForceReply(selective=True, input_field_placeholder="Your note (optional)"),
     )
     with db() as conn:
-        conn.execute("DELETE FROM moment_messages WHERE chat_id=? AND kind='prompt'", (replier_id,))
+        conn.execute("DELETE FROM moment_messages WHERE chat_id=? AND kind='prompt'", (recipient_id,))
         conn.execute("INSERT INTO pending_notes VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET moment_id=excluded.moment_id,created_at=excluded.created_at",
-                     (replier_id, moment_id, now_iso()))
-        conn.execute("INSERT INTO moment_messages VALUES(?,?,?,?,?)", (replier_id, prompt.message_id, moment_id, "prompt", now_iso()))
+                     (recipient_id, moment_id, now_iso()))
+        conn.execute("INSERT INTO moment_messages VALUES(?,?,?,?,?)", (recipient_id, prompt.message_id, moment_id, "prompt", now_iso()))
         conn.commit()
 
 
-async def save_note(update: Update, context: ContextTypes.DEFAULT_TYPE, moment_id: int,
-                     text: str = None, voice_file_id: str = None):
-    """Records a reply (text or voice) on a moment's thread and forwards it
-    to whichever of the two participants didn't write it. Either the
-    original sender or recipient may call this — the note is attributed to
-    whoever actually sent it, and delivered to the other one."""
+async def save_note(update: Update, context: ContextTypes.DEFAULT_TYPE, moment_id: int, note_text: str):
     if not await require_private(update):
         return
-    if text is not None and len(text) > MAX_TEXT_LENGTH:
+    if len(note_text) > MAX_TEXT_LENGTH:
         await update.message.reply_text(f"Please keep each note under {MAX_TEXT_LENGTH} characters; nothing was saved or sent.")
         return
 
@@ -1125,39 +1290,28 @@ async def save_note(update: Update, context: ContextTypes.DEFAULT_TYPE, moment_i
             return
 
         sender_id, recipient_id, link_session = row
-        author_id = update.effective_user.id
-        if author_id not in (sender_id, recipient_id):
+        if update.effective_user.id != recipient_id:
             await update.message.reply_text("That moment wasn't sent to you.")
             return
-        target_id = recipient_id if author_id == sender_id else sender_id
 
         if not moment_link_still_valid(sender_id, recipient_id, link_session):
             await update.message.reply_text("This connection isn't active anymore, so that note wasn't sent.")
             return
 
         source_id = update.message.message_id
-        if conn.execute("SELECT 1 FROM moment_notes WHERE author_id=? AND source_message_id=?", (author_id, source_id)).fetchone():
+        if conn.execute("SELECT 1 FROM moment_notes WHERE author_id=? AND source_message_id=?", (recipient_id, source_id)).fetchone():
             await update.message.reply_text("Note already saved.")
             return
         stamp = now_iso()
-        note_content_type = "voice" if voice_file_id else "text"
-        cursor = conn.execute(
-            "INSERT INTO moment_notes(moment_id,author_id,text,created_at,source_message_id,delivery_status,content_type,file_id) "
-            "VALUES(?,?,?,?,?,'pending',?,?)",
-            (moment_id, author_id, text or "", stamp, source_id, note_content_type, voice_file_id))
+        cursor = conn.execute("INSERT INTO moment_notes(moment_id,author_id,text,created_at,source_message_id,delivery_status) VALUES(?,?,?,?,?,'pending')",
+                              (moment_id, recipient_id, note_text, stamp, source_id))
         note_id = cursor.lastrowid
         conn.execute("UPDATE moments SET responded_at=? WHERE id=?", (stamp, moment_id))
         conn.commit()
 
-    reply_keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("💬 Reply", callback_data=f"note:{moment_id}")]])
-    if is_paused(target_id):
-        status = "paused"
-    elif voice_file_id:
-        status = await send_tracked(context, target_id, voice_file_id=voice_file_id, reply_markup=reply_keyboard,
-                                     moment_id=moment_id, reply_to=original_message_id(moment_id, target_id), kind="reply")
-    else:
-        status = await send_tracked(context, target_id, text=f"💬 {text}", reply_markup=reply_keyboard,
-                                     moment_id=moment_id, reply_to=original_message_id(moment_id, target_id), kind="reply")
+    status = "paused" if is_paused(sender_id) else await send_tracked(
+        context, sender_id, f"💬 {note_text}",
+        reply_to=original_message_id(moment_id, sender_id))
     with db() as conn:
         conn.execute("UPDATE moment_notes SET delivery_status=? WHERE id=?", (status, note_id))
         conn.commit()
@@ -1204,10 +1358,7 @@ async def on_this_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # One failed resend (e.g. an expired file_id) shouldn't stop the rest
         # of the batch from showing.
         try:
-            if content_type == "voice":
-                await context.bot.send_voice(chat_id=user_id, voice=file_id, caption=text or None)
-                await send_memory_text(context, user_id, meta)
-            elif content_type == "photo":
+            if content_type == "photo":
                 # Photo captions have a hard 1024-char Telegram limit, and
                 # `text` here is already capped to that on its own — but
                 # combining it with the metadata line could still blow past
@@ -1217,6 +1368,10 @@ async def on_this_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await send_memory_text(context, user_id, meta)
             else:
                 await send_memory_text(context, user_id, f"{text}\n\n{meta}")
+            with db() as conn:
+                editable = album_moment(conn, user_id, m_id, edit=True)
+            if editable:
+                await context.bot.send_message(chat_id=user_id, text="Organize this moment", reply_markup=album_keyboard([[('Manage tags',f'alb:edit:{m_id}:0')]]))
         except Exception as e:
             print(f"/onthisday: failed to resend moment {m_id}: {type(e).__name__}: {e}")
             await update.message.reply_text(f"⚠️ Couldn't show one moment from {meta.splitlines()[0]}.")
@@ -1249,12 +1404,14 @@ async def random_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=user_id, text="No shared memories yet. Once a moment is delivered, you can revisit it here.")
         return
     moment_id, sender_id, kind, file_id, text, created_at, reaction, note, status = row
-    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🎲 Another memory", callback_data=f"memory:{moment_id}")]])
+    buttons = [[InlineKeyboardButton("🎲 Another memory", callback_data=f"memory:{moment_id}")]]
+    with db() as conn:
+        if album_moment(conn, user_id, moment_id, edit=True):
+            buttons.append([InlineKeyboardButton("Manage tags", callback_data=f"alb:edit:{moment_id}:0")])
+    keyboard = InlineKeyboardMarkup(buttons)
     meta = memory_details(moment_id, user_id, sender_id, created_at, reaction, note, status)
     try:
-        if kind == "voice":
-            await context.bot.send_voice(chat_id=user_id, voice=file_id, caption=text or None)
-        elif kind == "photo":
+        if kind == "photo":
             await context.bot.send_photo(chat_id=user_id, photo=file_id)
             if text:
                 await send_memory_text(context, user_id, "Original caption: " + text)
@@ -1275,249 +1432,6 @@ async def send_memory_text(context, user_id, text, keyboard=None):
 
 
 # ---------------------------------------------------------------------------
-# Diary — private moment-by-moment browsing (Phase 3, core)
-#
-# No stored cursor: every button carries its target moment id, so it's
-# restart-safe and immune to a new moment landing mid-browse. Navigating (or
-# re-running /diary) deletes the previous diary message(s) first, so at most
-# one moment is ever visible in the chat instead of piling one up per tap.
-# Read-only — no partner notifications, and it works while paused.
-#
-# Note: the filter string below is duplicated in three functions rather than
-# hoisted to a module constant. The test suite execs this file's top-level
-# *functions* in isolation (see tests/test_review_fixes.py) — a module-level
-# constant wouldn't be carried over, so every name these functions need has
-# to either be a builtin, a parameter, or defined inside the function itself.
-# ---------------------------------------------------------------------------
-def diary_moment_row(conn, user_id, moment_id):
-    filt = "(sender_id=? OR recipient_id=?) AND delivery_status IN ('delivered','legacy') AND created_at IS NOT NULL"
-    return conn.execute(
-        "SELECT id, sender_id, recipient_id, content_type, file_id, text, created_at, reaction, reply_note, delivery_status, link_session "
-        f"FROM moments WHERE id=? AND {filt}",
-        (moment_id, user_id, user_id),
-    ).fetchone()
-
-
-def diary_newest_id(conn, user_id):
-    filt = "(sender_id=? OR recipient_id=?) AND delivery_status IN ('delivered','legacy') AND created_at IS NOT NULL"
-    row = conn.execute(f"SELECT id FROM moments WHERE {filt} ORDER BY id DESC LIMIT 1", (user_id, user_id)).fetchone()
-    return row[0] if row else None
-
-
-def diary_neighbor_id(conn, user_id, anchor_id, older):
-    filt = "(sender_id=? OR recipient_id=?) AND delivery_status IN ('delivered','legacy') AND created_at IS NOT NULL"
-    comparison = "id < ? ORDER BY id DESC" if older else "id > ? ORDER BY id ASC"
-    row = conn.execute(f"SELECT id FROM moments WHERE {filt} AND {comparison} LIMIT 1",
-                       (user_id, user_id, anchor_id)).fetchone()
-    return row[0] if row else None
-
-
-def diary_boundary_marker(conn, user_id, moment_id, moment_session):
-    """True if the next-newer moment belongs to a different pairing session
-    (NULL/legacy counts as its own session) — i.e. moment_id is the newest
-    moment of an earlier session, viewed while paging backward."""
-    filt = "(sender_id=? OR recipient_id=?) AND delivery_status IN ('delivered','legacy') AND created_at IS NOT NULL"
-    row = conn.execute(f"SELECT link_session FROM moments WHERE {filt} AND id > ? ORDER BY id ASC LIMIT 1",
-                       (user_id, user_id, moment_id)).fetchone()
-    if row is None:
-        return False  # nothing newer to compare against
-    return row[0] != moment_session
-
-
-def diary_months(conn, user_id):
-    filt = "(sender_id=? OR recipient_id=?) AND delivery_status IN ('delivered','legacy') AND created_at IS NOT NULL"
-    rows = conn.execute(
-        f"SELECT strftime('%Y-%m', created_at, '+8 hours') AS ym, COUNT(*) FROM moments "
-        f"WHERE {filt} GROUP BY ym ORDER BY ym DESC",
-        (user_id, user_id),
-    ).fetchall()
-    return [(ym, count) for ym, count in rows if ym]
-
-
-def diary_month_newest_id(conn, user_id, year_month):
-    filt = "(sender_id=? OR recipient_id=?) AND delivery_status IN ('delivered','legacy') AND created_at IS NOT NULL"
-    row = conn.execute(
-        f"SELECT id FROM moments WHERE {filt} AND strftime('%Y-%m', created_at, '+8 hours') = ? ORDER BY id DESC LIMIT 1",
-        (user_id, user_id, year_month),
-    ).fetchone()
-    return row[0] if row else None
-
-
-def diary_month_label(year_month):
-    year, month = year_month.split("-")
-    return datetime(int(year), int(month), 1).strftime("%B %Y")
-
-
-def diary_keyboard(moment_id, older_id, newer_id):
-    nav = []
-    if older_id is not None:
-        nav.append(InlineKeyboardButton("⬅️ Older", callback_data=f"diary:at:{older_id}"))
-    if newer_id is not None:
-        nav.append(InlineKeyboardButton("Newer ➡️", callback_data=f"diary:at:{newer_id}"))
-    rows = [nav] if nav else []
-    rows.append([InlineKeyboardButton("📅 Months", callback_data=f"diary:months:{moment_id}")])
-    return InlineKeyboardMarkup(rows)
-
-
-def diary_months_keyboard(months, back_id):
-    buttons = [InlineKeyboardButton(f"{diary_month_label(ym)} · {count}", callback_data=f"diary:month:{ym}")
-               for ym, count in months]
-    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data=f"diary:at:{back_id}")])
-    return InlineKeyboardMarkup(rows)
-
-
-async def diary_send_text(context, user_id, text, keyboard=None):
-    # Conservative chunks also accommodate old, uncapped archive entries.
-    chunks = [text[i:i + 1800] for i in range(0, len(text), 1800)]
-    ids = []
-    for index, chunk in enumerate(chunks):
-        sent = await context.bot.send_message(chat_id=user_id, text=chunk,
-            reply_markup=keyboard if index == len(chunks) - 1 else None)
-        ids.append(sent.message_id)
-    return ids
-
-
-async def diary_clear(context, user_id):
-    """Deletes whatever diary view is currently shown to this user."""
-    with db() as conn:
-        ids = [r[0] for r in conn.execute(
-            "SELECT message_id FROM moment_messages WHERE chat_id=? AND kind='diary'", (user_id,)
-        ).fetchall()]
-        conn.execute("DELETE FROM moment_messages WHERE chat_id=? AND kind='diary'", (user_id,))
-        conn.commit()
-    for message_id in ids:
-        try:
-            await context.bot.delete_message(chat_id=user_id, message_id=message_id)
-        except Exception as e:
-            # Telegram only allows deleting a bot's own messages for 48h;
-            # past that (or if it's already gone) this is harmless to skip.
-            print(f"diary_clear: delete_message failed (non-fatal) chat_id={user_id} message_id={message_id}: {type(e).__name__}: {e}")
-
-
-async def diary_render(context, user_id, moment_id) -> bool:
-    """Sends `moment_id` as the user's diary view. Returns False without
-    sending anything if it doesn't belong to this user's diary (wrong
-    owner, wrong status, or gone)."""
-    with db() as conn:
-        row = diary_moment_row(conn, user_id, moment_id)
-        if row is None:
-            return False
-        older_id = diary_neighbor_id(conn, user_id, moment_id, older=True)
-        newer_id = diary_neighbor_id(conn, user_id, moment_id, older=False)
-        (m_id, sender_id, recipient_id, content_type, file_id, text,
-         created_at, reaction, note, status, link_session) = row
-        crosses_boundary = diary_boundary_marker(conn, user_id, m_id, link_session)
-
-    keyboard = diary_keyboard(m_id, older_id, newer_id)
-    details = memory_details(m_id, user_id, sender_id, created_at, reaction, note, status, heading="📖")
-    if crosses_boundary:
-        details = f"— earlier connection —\n{details}"
-
-    sent_ids = []
-    media_failed = False
-    if content_type == "voice":
-        try:
-            sent = await context.bot.send_voice(chat_id=user_id, voice=file_id, caption=text or None)
-            sent_ids.append(sent.message_id)
-        except Exception as e:
-            print(f"diary_render: voice unavailable for moment {m_id}: {type(e).__name__}: {e}")
-            media_failed = True
-    elif content_type == "photo":
-        try:
-            sent = await context.bot.send_photo(chat_id=user_id, photo=file_id, caption=text or None)
-            sent_ids.append(sent.message_id)
-        except Exception as e:
-            print(f"diary_render: photo unavailable for moment {m_id}: {type(e).__name__}: {e}")
-            media_failed = True
-
-    if content_type == "text":
-        body = f"{text}\n\n{details}" if text else details
-    elif media_failed:
-        body = f"(media unavailable)\n\n{details}"
-    else:
-        body = details
-
-    sent_ids.extend(await diary_send_text(context, user_id, body, keyboard))
-
-    with db() as conn:
-        for message_id in sent_ids:
-            conn.execute("INSERT OR IGNORE INTO moment_messages VALUES(?,?,?,?,?)",
-                         (user_id, message_id, m_id, "diary", now_iso()))
-        conn.commit()
-    return True
-
-
-async def diary_open(context, user_id, moment_id):
-    """Shared entry point for /diary and diary navigation: clears whatever
-    diary view is currently shown, then renders `moment_id`."""
-    await diary_clear(context, user_id)
-    if not await diary_render(context, user_id, moment_id):
-        await context.bot.send_message(chat_id=user_id, text="This moment isn't available anymore.")
-
-
-async def diary_open_months(context, user_id, back_id):
-    """Clears whatever diary view is shown and renders the month picker,
-    with Back returning to `back_id`."""
-    await diary_clear(context, user_id)
-    with db() as conn:
-        months = diary_months(conn, user_id)
-    keyboard = diary_months_keyboard(months, back_id)
-    sent = await context.bot.send_message(chat_id=user_id, text="📅 Pick a month:", reply_markup=keyboard)
-    with db() as conn:
-        # moment_id 0: this message isn't about any one moment (no real
-        # moment id is ever 0, since the table's ids start at 1).
-        conn.execute("INSERT OR IGNORE INTO moment_messages VALUES(?,?,?,?,?)",
-                     (user_id, sent.message_id, 0, "diary", now_iso()))
-        conn.commit()
-
-
-async def diary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_private(update):
-        return
-    user_id = update.effective_user.id
-    with db() as conn:
-        newest_id = diary_newest_id(conn, user_id)
-    if newest_id is None:
-        await diary_clear(context, user_id)
-        await update.message.reply_text("Nothing in the diary yet — moments show up here once they've been delivered.")
-        return
-    await diary_open(context, user_id, newest_id)
-
-
-async def diary_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not is_private_chat(update):
-        await query.answer("Please use the bot in a private chat.", show_alert=True)
-        return
-    parts = query.data.split(":", 2)
-    if len(parts) != 3:
-        await query.answer("That button is no longer available.")
-        return
-    action, value = parts[1], parts[2]
-    user_id = query.from_user.id
-
-    if action in ("at", "months"):
-        try:
-            target_id = int(value)
-        except ValueError:
-            await query.answer("That button is no longer available.")
-            return
-        await query.answer()
-        if action == "at":
-            await diary_open(context, user_id, target_id)
-        else:
-            await diary_open_months(context, user_id, target_id)
-    elif action == "month":
-        await query.answer()
-        with db() as conn:
-            moment_id = diary_month_newest_id(conn, user_id, value)
-        await diary_open(context, user_id, moment_id)
-    else:
-        await query.answer("That button is no longer available.")
-
-
-# ---------------------------------------------------------------------------
 # Help
 # ---------------------------------------------------------------------------
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1525,8 +1439,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     msg = (
         "*A little bit of my day*\n\n"
-        "Send a photo, voice message, or a short note any time — it goes straight to your partner, no approval step.\n\n"
-        "They can tap a reaction, reply to a received moment with a text or voice note, or just leave it — nothing is required. Either of you can keep replying, and multiple notes are kept together.\n\n"
+        "Send a photo or a short note any time — it goes straight to your partner, no approval step.\n\n"
+        "They can tap a reaction, reply to a received moment with a text note, or just leave it — nothing is required. Multiple notes are kept together.\n\n"
         "`/start` — get a pairing code (or begin if you already have one)\n"
         "`/link <code>` — connect using a code your partner sent you\n"
         "`/unlink` — disconnect (asks to confirm)\n"
@@ -1534,8 +1448,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/resume` — turn deliveries back on\n"
         "`/cancel` — cancel a note you tapped 'Add a note' for but haven't sent yet\n"
         "`/reactions` — view or customize your pair's reactions\n"
+        "`/albums` — browse shared albums and manage tags\n"
+        "Add optional #Bangkok #Food to photo captions or new text moments.\n"
+        "`/tags <id> add #tag` or `/tags <id> remove #tag` — edit tags\n"
         "`/memory` — revisit a random memory, just for you\n"
-        "`/diary` — browse your shared moments, one at a time\n"
         "Dates and times use Singapore time.\n"
         "`/onthisday` — see what you shared on this date in previous years\n"
         "`/help` — show this message"
@@ -1563,17 +1479,18 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("memory", random_memory))
     app.add_handler(CommandHandler("random", random_memory))
     app.add_handler(CommandHandler("onthisday", on_this_day))
-    app.add_handler(CommandHandler("diary", diary_command))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("albums", albums_command))
+    app.add_handler(CommandHandler("tags", tags_command))
+    app.add_handler(CallbackQueryHandler(album_callback, pattern="^alb:"))
 
     app.add_handler(CallbackQueryHandler(unlink_callback, pattern="^unlink(confirm|cancel):"))
     app.add_handler(CallbackQueryHandler(react_callback, pattern="^(react|choice):"))
     app.add_handler(CallbackQueryHandler(note_callback, pattern="^note:"))
     app.add_handler(CallbackQueryHandler(random_memory, pattern="^memory:"))
-    app.add_handler(CallbackQueryHandler(diary_callback, pattern="^diary:"))
 
     app.add_handler(MessageHandler(
-        filters.ChatType.PRIVATE & (filters.PHOTO | filters.VOICE | (filters.TEXT & ~filters.COMMAND)),
+        filters.ChatType.PRIVATE & (filters.PHOTO | (filters.TEXT & ~filters.COMMAND)),
         handle_incoming,
     ))
 
