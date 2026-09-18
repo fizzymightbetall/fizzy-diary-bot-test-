@@ -366,7 +366,7 @@ async def album_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         _,action,item,page=query.data.split(':')
         item,page=int(item),int(page)
-        if action not in ('home','scope','open','all','edit','add','remove') or item<0 or page<0:
+        if action not in ('home','earlier','scope','open','all','edit','add','remove') or item<0 or page<0:
             raise ValueError()
     except (ValueError,TypeError):
         await query.answer('This button is unavailable.')
@@ -387,6 +387,17 @@ async def album_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await album_panel(context,user_id,action,item,page)
 
 
+def album_display_content(content,tag_keys):
+    """Hide current organizational tags in browsing only; stored content stays intact."""
+    import re
+    import unicodedata
+    def replace(match):
+        key=unicodedata.normalize('NFC',match.group(1)).casefold()
+        return '' if key in tag_keys else match.group(0)
+    cleaned=re.sub(r'(?<![\w#])#(\w+)',replace,content or '')
+    return '\n'.join(re.sub(r'[ \t]+',' ',line).strip() for line in cleaned.splitlines()).strip()
+
+
 async def album_panel(context,user_id,action,item,page):
     # Read authorization is checked on every callback, not just on the first screen.
     # A scope is identified by an accessible moment ID; no session string is trusted from clients.
@@ -395,19 +406,35 @@ async def album_panel(context,user_id,action,item,page):
     page_size=8
     with db() as conn:
         if action=='home':
-            scopes=conn.execute('''SELECT MAX(id),sender_id,recipient_id,link_session,MAX(created_at)
+            link=get_partner_id(user_id)
+            current=None
+            if link and moment_link_still_valid(user_id,link[0],session_token(link[2])):
+                current=conn.execute("""SELECT MAX(id) FROM moments
+                    WHERE MIN(sender_id,recipient_id)=? AND MAX(sender_id,recipient_id)=?
+                    AND link_session=? AND delivery_status IN ('delivered','legacy')""",
+                    (min(user_id,link[0]),max(user_id,link[0]),session_token(link[2]))).fetchone()[0]
+            if current:
+                # Resolve the current session server-side; retain authorization in scope.
+                await album_panel(context,user_id,'scope',current,0)
+                return
+            text='📚 Your shared albums\nNo moments in your current pairing yet. Send a photo or note whenever you like.' if link else '📚 Your shared albums\nYou are not currently paired.'
+            rows.append([('Earlier albums','alb:earlier:0:0')])
+        elif action=='earlier':
+            scopes=conn.execute("""SELECT MAX(id),sender_id,recipient_id,link_session,MAX(created_at)
                 FROM moments WHERE (sender_id=? OR recipient_id=?)
                 AND delivery_status IN ('delivered','legacy') AND link_session IS NOT NULL AND link_session!=''
                 GROUP BY MIN(sender_id,recipient_id),MAX(sender_id,recipient_id),link_session
-                ORDER BY MAX(created_at) DESC LIMIT ? OFFSET ?''',(user_id,user_id,page_size+1,page*page_size)).fetchall()
-            text='📚 Your shared albums\nChoose a pairing session. Browsing is private.\n'
-            if not scopes:
-                text+='No moments with a known pairing session yet. Older unassigned memories remain in /memory.'
-            for mid,a,b,session,stamp in scopes[:page_size]:
-                active=moment_link_still_valid(a,b,session)
-                rows.append([(f'{"Current pair" if active else "Earlier pairing"} · {friendly_timestamp(stamp)}',f'alb:scope:{mid}:0')])
-            if page: rows.append([('← Previous',f'alb:home:0:{page-1}')])
-            if len(scopes)>page_size: rows.append([('Next →',f'alb:home:0:{page+1}')])
+                ORDER BY MAX(created_at) DESC""",(user_id,user_id)).fetchall()
+            scopes=[r for r in scopes if not moment_link_still_valid(r[1],r[2],r[3])]
+            visible=scopes[page*page_size:(page+1)*page_size]
+            text='📚 Earlier albums\nBrowsing is private. Earlier pairings are read-only.'
+            if not visible:
+                text+='\nNo earlier albums here. Older unassigned memories remain in /memory.'
+            for mid,a,b,session,stamp in visible:
+                rows.append([(f'Earlier pairing · {friendly_timestamp(stamp)}',f'alb:scope:{mid}:0')])
+            if page: rows.append([('← Previous',f'alb:earlier:0:{page-1}')])
+            if len(scopes)>(page+1)*page_size: rows.append([('Next →',f'alb:earlier:0:{page+1}')])
+            rows.append([('Current albums','alb:home:0:0')])
         elif action in ('scope','all','edit'):
             ref=album_moment(conn,user_id,item,edit=action=='edit')
             if not ref or not ref[10]:
@@ -443,7 +470,8 @@ async def album_panel(context,user_id,action,item,page):
                         rows.append([('#'+name,f'alb:open:{aid}:0')])
                 if page: rows.append([('← Previous',f'alb:{action}:{item}:{page-1}')])
                 if len(albums)>page_size: rows.append([('Next →',f'alb:{action}:{item}:{page+1}')])
-                rows.append([('Pairing sessions','alb:home:0:0')])
+                rows.append([('Earlier albums','alb:earlier:0:0')])
+                rows.append([('Current albums','alb:home:0:0')])
         elif action=='open':
             album=conn.execute('SELECT user_low,user_high,link_session,display_name FROM albums WHERE id=? AND (user_low=? OR user_high=?)',(item,user_id,user_id)).fetchone()
             if not album:
@@ -452,7 +480,7 @@ async def album_panel(context,user_id,action,item,page):
             matches=conn.execute('''SELECT m.id FROM moments m JOIN album_moments am ON am.moment_id=m.id
                 WHERE am.album_id=? AND MIN(m.sender_id,m.recipient_id)=? AND MAX(m.sender_id,m.recipient_id)=?
                 AND m.link_session=? AND m.delivery_status IN ('delivered','legacy') ORDER BY m.id DESC LIMIT 2 OFFSET ?''',(item,*album[:3],page)).fetchall()
-            text='#'+album[3]
+            text='📚 '+album[3]
             if matches:
                 moment=album_moment(conn,user_id,matches[0][0])
                 if page: rows.append([('← Previous',f'alb:open:{item}:{page-1}')])
@@ -460,12 +488,19 @@ async def album_panel(context,user_id,action,item,page):
                 rows.append([('Back to albums',f'alb:scope:{moment[0]}:0')])
             else:
                 text+='\nNo moments in this album on this page.'
-                rows.append([('Pairing sessions','alb:home:0:0')])
+                rows.append([('Earlier albums','alb:earlier:0:0')])
+                rows.append([('Current albums','alb:home:0:0')])
         else:
             return
         if moment:
             labels=moment_album_labels(conn,moment)
-            text+='\n'+(' '.join('#'+x[1] for x in labels) or 'No tags')
+            other_labels=[x[1] for x in labels if action!='open' or x[0]!=item]
+            if other_labels:
+                text+='\n'+('Also in: ' if action=='open' else 'Albums: ')+', '.join(other_labels)
+            tag_keys={r[0] for r in conn.execute("""SELECT a.tag_key FROM albums a
+                JOIN album_moments am ON am.album_id=a.id WHERE am.moment_id=?
+                AND a.user_low=? AND a.user_high=? AND a.link_session=?""",
+                (moment[0],min(moment[1],moment[2]),max(moment[1],moment[2]),moment[10])).fetchall()}
             if moment[10] and moment_link_still_valid(moment[1],moment[2],moment[10]):
                 rows.append([('Manage tags',f'alb:edit:{moment[0]}:0')])
     keyboard=album_keyboard(rows)
@@ -475,6 +510,7 @@ async def album_panel(context,user_id,action,item,page):
             delivered=await send_safe(context,user_id,photo_file_id=file_id)
             if not delivered:
                 await context.bot.send_message(chat_id=user_id,text='Could not load the photo. You can still browse its details.')
+        content=album_display_content(content,tag_keys)
         if content:
             await send_memory_text(context,user_id,content)
         text+='\n\n'+memory_details(mid,user_id,sender,stamp,reaction,note,status,heading='📖')
